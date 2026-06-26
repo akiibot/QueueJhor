@@ -23,7 +23,7 @@ for case in cases:
                     "output": out.model_dump()})
 
 with open(os.path.join(ROOT, "sample_output.json"), "w", encoding="utf-8") as fh:
-    json.dump({"generated_by": "QueueStorm Investigator", "results": results},
+    json.dump({"generated_by": "QueueJhor", "results": results},
               fh, ensure_ascii=False, indent=2)
 
 print(f"Wrote sample_output.json with {len(results)} cases.")

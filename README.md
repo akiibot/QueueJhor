@@ -1,4 +1,4 @@
-# QueueStorm Investigator
+# QueueJhor
 
 Evidence-grounded support-ops copilot for digital finance — built for the
 **SUST CSE Carnival 2026 · Codex Community Hackathon (Online Preliminary)**.
@@ -31,8 +31,8 @@ curl -X POST http://localhost:8000/analyze-ticket \
 Or with Docker:
 
 ```bash
-docker build -t queuestorm-team .
-docker run -p 8000:8000 queuestorm-team
+docker build -t queuejhor .
+docker run -p 8000:8000 queuejhor
 ```
 
 ---

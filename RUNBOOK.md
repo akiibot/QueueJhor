@@ -1,4 +1,4 @@
-# RUNBOOK — QueueStorm Investigator
+# RUNBOOK — QueueJhor
 
 A stranger should be able to bring this service up by copy-pasting from here.
 No environment variables are required; the service runs fully in rules-only mode.
@@ -9,7 +9,7 @@ No environment variables are required; the service runs fully in rules-only mode
 
 ```bash
 git clone <your-repo-url>
-cd queuestorm-investigator
+cd QueueJhor
 
 python3.11 -m venv .venv
 . .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -34,8 +34,8 @@ curl -X POST http://localhost:8000/analyze-ticket \
 ## 2. Run with Docker
 
 ```bash
-docker build -t queuestorm-team .
-docker run -p 8000:8000 queuestorm-team
+docker build -t queuejhor .
+docker run -p 8000:8000 queuejhor
 ```
 
 The container binds to `0.0.0.0:8000` (override with `-e PORT=...`). Image is
@@ -45,7 +45,7 @@ under the 500 MB recommendation.
 With the optional LLM polish:
 
 ```bash
-docker run -p 8000:8000 --env-file judging.env queuestorm-team
+docker run -p 8000:8000 --env-file judging.env queuejhor
 # judging.env contains: USE_LLM=true and ANTHROPIC_API_KEY=...
 ```
 

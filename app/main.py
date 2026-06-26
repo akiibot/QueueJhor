@@ -21,12 +21,12 @@ from .safety import enforce
 from .schemas import AnalysisResponse, TicketRequest
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("queuestorm")
+logger = logging.getLogger("queuejhor")
 
 app = FastAPI(
-    title="QueueStorm Investigator",
+    title="QueueJhor",
     version="1.0",
-    description="Evidence-grounded support-ops copilot for digital finance.",
+    description="QueueJhor — Evidence-grounded support-ops copilot for digital finance.",
 )
 
 
