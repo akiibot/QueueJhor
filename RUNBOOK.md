@@ -42,11 +42,11 @@ The container binds to `0.0.0.0:8000` (override with `-e PORT=...`). Image is
 based on `python:3.11-slim` with only pure-Python dependencies — comfortably
 under the 500 MB recommendation.
 
-With the optional LLM polish:
+With the optional Gemini AI fallback:
 
 ```bash
 docker run -p 8000:8000 --env-file judging.env queuejhor
-# judging.env contains: USE_LLM=true and ANTHROPIC_API_KEY=...
+# judging.env contains: USE_LLM=true and GEMINI_API_KEY=<your key>
 ```
 
 ---
@@ -71,20 +71,21 @@ Fly.io, a Poridhi Lab VM, EC2, …). General recipe:
 
 - New → Web Service → connect repo.
 - Environment: Docker (uses the included `Dockerfile`).
-- No environment variables needed (add `USE_LLM` / `ANTHROPIC_API_KEY` only if
-  you want LLM polish — set them in Render's dashboard, never in the repo).
+- No environment variables needed for rules-only mode. To enable the Gemini
+  AI fallback, add `USE_LLM=true` and `GEMINI_API_KEY` in the Render dashboard —
+  never in the repo.
 
 ---
 
 ## 4. Environment variables (all optional)
 
-| Variable            | Default                      | Purpose                                  |
-|---------------------|------------------------------|------------------------------------------|
-| `PORT`              | `8000`                       | Port to bind.                            |
-| `USE_LLM`           | `false`                      | Enable optional LLM polish of text.      |
-| `ANTHROPIC_API_KEY` | _(empty)_                    | Required only when `USE_LLM=true`.       |
-| `LLM_MODEL`         | `claude-haiku-4-5-20251001`  | Polish model.                            |
-| `LLM_TIMEOUT`       | `8`                          | Seconds before falling back to templates.|
+| Variable          | Default              | Purpose                                              |
+|-------------------|----------------------|------------------------------------------------------|
+| `PORT`            | `8000`               | Port to bind.                                        |
+| `USE_LLM`         | `false`              | Enable Gemini fallback for ambiguous tickets only.   |
+| `GEMINI_API_KEY`  | _(empty)_            | Required only when `USE_LLM=true`.                   |
+| `GEMINI_MODEL`    | `gemini-2.0-flash`   | Gemini model (free tier supported).                  |
+| `LLM_TIMEOUT`     | `10`                 | Seconds before falling back to rules result.         |
 
 Secrets are read from the environment only. Never commit a real key; see
 `.env.example`.

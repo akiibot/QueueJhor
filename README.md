@@ -25,7 +25,7 @@ curl http://localhost:8000/health        # -> {"status":"ok"}
 # Analyze a ticket
 curl -X POST http://localhost:8000/analyze-ticket \
   -H 'content-type: application/json' \
-  -d @tests/sample_cases.json   # (send a single case's "input" object)
+  -d '{"ticket_id":"T1","complaint":"I sent 5000 taka to a wrong number.","transaction_history":[{"transaction_id":"TXN-1","type":"transfer","amount":5000,"counterparty":"+8801799999999","status":"completed"}]}'
 ```
 
 Or with Docker:
@@ -59,8 +59,7 @@ A worked output for all 10 public sample cases is in
 
 ## Architecture & AI approach
 
-This is a **rules-first hybrid**, deliberately chosen for safety, latency, and
-reliability under the automated judge:
+Two-tier pipeline: **deterministic rules first, Gemini AI only as a last resort.**
 
 ```
 complaint + transaction_history
@@ -71,39 +70,60 @@ complaint + transaction_history
         ▼
   reasoning.py   classify → match transaction → evidence_verdict → severity
                  → department → human_review → confidence → reason_codes
-        │                       (100% deterministic — this is the scored core)
-        ▼
-  replies.py     safe agent_summary / next_action / customer_reply (en + bn templates)
+                 (100% deterministic — this is the scored core)
         │
         ▼
-  llm.py         OPTIONAL polish of summary + reply (off by default)
-        │
-        ▼
-  safety.py      always-on backstop: scrub credential requests & refund promises
-        │
-        ▼
+   Confident result?
+   /             \
+ YES              NO (vague, ambiguous, unmatched, "other")
+  │                │
+  │          USE_LLM=true + GEMINI_API_KEY set?
+  │           /                    \
+  │         YES                     NO
+  │          │                      │
+  │    ai_fallback.py          rules result
+  │    (Gemini, 10s cap)       unchanged
+  │          │
+  │    safety.py ◄─────────────────┘
+  │    (always runs on all text)
+  │          │
+  ▼          ▼
   structured JSON response
 ```
 
-**Why rules own the decision.** Every field the judge scores
+### Why rules own the decision
+
+Every field the judge scores
 (`relevant_transaction_id`, `evidence_verdict`, `case_type`, `department`,
 `severity`, `human_review_required`) is computed by explicit, inspectable rules
 over both the complaint **and** the transaction list. This makes the service:
 
 - **deterministic** — same input, same output, no enum/schema drift;
-- **fast** — typically single-digit milliseconds, far under the 30s timeout and
-  the 5s full-latency-credit threshold;
+- **fast** — single-digit milliseconds, far under the 30s timeout and the 5s
+  full-latency-credit threshold;
 - **injection-proof on the core score** — instructions hidden in complaint text
   cannot change a verdict, because the verdict is not produced by a language
   model;
 - **dependency-free** — no API key, no network, no model weights required to
   score well.
 
-**Where the optional LLM helps.** If `USE_LLM=true` and `ANTHROPIC_API_KEY` is
-set, an LLM only *rephrases* the already-decided `agent_summary` and
-`customer_reply` for fluency (useful for nuanced Banglish). It cannot alter the
-decision, it runs under an 8s timeout, and **any** failure falls back silently
-to the rule-based text. The safety filter then runs on whatever text comes back.
+### Where Gemini helps (and when it's skipped)
+
+When `USE_LLM=true` and `GEMINI_API_KEY` is set, **Gemini is only called for
+tickets the rules genuinely could not resolve** — vague complaints, multiple
+ambiguous matching transactions, or no matching transaction at all. These are
+the cases that would otherwise return a low-value "please clarify" response.
+
+Gemini is **never called** for:
+- Cases the rules already handled confidently (clear wrong transfer, obvious
+  duplicate, phishing, failed payment with a matching transaction, etc.)
+- Phishing reports (injection risk; the rules handle these at `critical` severity)
+
+On any Gemini failure (timeout, quota, bad JSON) the service falls back to the
+rule-based response silently — no 500, no degradation.
+
+The `ai_fallback_used` reason code is added when Gemini's answer is applied, so
+it's visible in the response.
 
 ### The "investigator" logic (highlights)
 
@@ -112,13 +132,13 @@ to the rule-based text. The safety filter then runs on whatever text comes back.
   counterparty (SAMPLE-02).
 - **Ambiguity → `null`** — when several transactions plausibly match and nothing
   disambiguates them, we return `relevant_transaction_id: null` +
-  `insufficient_data` and ask the customer, rather than guessing (SAMPLE-08).
-- **Duplicate detection** — two identical completed payments to the same
-  counterparty resolve to the **later** transaction as the suspected duplicate
-  (SAMPLE-10).
+  `insufficient_data` and (with Gemini) try to resolve; without Gemini, we ask
+  the customer (SAMPLE-08).
+- **Duplicate detection** — two identical completed payments resolve to the
+  **later** transaction as the suspected duplicate (SAMPLE-10).
 - **Escalation matrix** — `human_review_required` is `true` for phishing, and
   for wrong-transfer / duplicate / agent-cash-in cases **only once a specific
-  transaction is identified**; clarification-needed cases stay `false`.
+  transaction is identified**.
 
 ---
 
@@ -130,7 +150,7 @@ Safety is enforced in two places so a single mistake cannot leak through:
    use "any eligible amount will be returned through official channels" instead
    of promising refunds, and point only to official channels.
 2. **Backstop filter** ([`app/safety.py`](app/safety.py)) — runs on every
-   `customer_reply` and `recommended_next_action`, including LLM output. It
+   `customer_reply` and `recommended_next_action`, including Gemini output. It
    detects and replaces:
    - requests for PIN / OTP / password / card number (while *allowing* the safe
      "do not share your PIN" reminder, via negation-aware matching),
@@ -146,37 +166,32 @@ third-party) penalties are not triggered even under prompt-injection attempts.
 
 | Model | Where it runs | Why / when |
 |-------|---------------|------------|
-| **None (rule-based engine)** | In-process, CPU only | **Default.** Powers every scored decision and all safety guardrails. No key, no cost, deterministic, instant. |
-| `claude-haiku-4-5` (Anthropic) | Optional remote API call | **Off by default.** Only when `USE_LLM=true` + key set. Rephrases `agent_summary` and `customer_reply` for fluency; never changes the decision; 8s timeout with template fallback. Chosen for low latency/cost so it stays well within the 30s budget. |
+| **None (rule-based engine)** | In-process, CPU only | **Default.** Powers every scored decision and all safety guardrails. No key, no cost, deterministic, instant. Used for ALL confident cases even when USE_LLM=true. |
+| `gemini-2.0-flash` (Google) | Optional remote API call | **Fallback only.** Only when `USE_LLM=true` + `GEMINI_API_KEY` set, AND the rules engine could not confidently categorize the ticket. 10s timeout with rules fallback. Chosen for its free tier and low latency. |
 
 No GPU, no local model weights, no multi-GB downloads. Docker image is a slim
-`python:3.11-slim` + pure-Python deps.
+`python:3.11-slim` + pure-Python deps (~200 MB).
 
 ---
 
 ## Assumptions
 
 - Transaction amounts in the complaint are in BDT and roughly match a history
-  entry's `amount`; approximate time references ("2pm", "today") are secondary
-  hints, not hard requirements.
-- `agent_summary` and `recommended_next_action` are internal (English), as in
-  the sample pack; only `customer_reply` is localized to the complaint language.
+  entry's `amount`; approximate time references are secondary hints.
+- `agent_summary` and `recommended_next_action` are internal (always English);
+  only `customer_reply` is localized to the complaint language.
 - A complaint may include a phone number that is the *intended* (not actual)
-  recipient, so phone matching is used to narrow candidates but amount + type
-  remain the primary signal.
-- Phishing reports are critical by default and are about an external contact,
-  so `relevant_transaction_id` is `null` / `insufficient_data`.
+  recipient, so phone matching narrows candidates but amount + type are primary.
+- Phishing reports are critical by default and about an external contact, so
+  `relevant_transaction_id` is `null` / `insufficient_data`.
 
 ## Known limitations
 
-- Classification is keyword-driven; highly indirect phrasing in a language we
-  have fewer keywords for (deep Banglish slang) may fall to `other` /
-  `insufficient_data` — a deliberately safe failure mode rather than a wrong
-  confident answer.
-- Time-of-day matching is coarse (hour-level) and not used to break ties when
-  amounts already disambiguate.
-- The optional LLM polish requires the team's own Anthropic key and network
-  egress; without it the service uses the (already safe) templates.
+- Classification is keyword-driven; highly indirect phrasing in an unsupported
+  dialect may fall to `other` / `insufficient_data` — a deliberately safe
+  failure mode. Gemini (when enabled) handles these cases.
+- The Gemini fallback requires the team's own API key and network egress from
+  the deployment environment. Without it the service uses rules templates.
 
 ## Tests
 
@@ -188,10 +203,16 @@ python -m pytest -q
 - `tests/test_samples.py` — functional equivalence on all 10 public cases
   (decision fields + reply safety + Bangla-language check).
 - `tests/test_adversarial.py` — health, 400/422/invalid-JSON handling, empty /
-  missing fields, prompt-injection, safety-filter behavior, Bangla parsing.
+  missing fields, prompt-injection, safety-filter behaviour, Bangla parsing.
 
 ## Deployment
 
 See [`RUNBOOK.md`](RUNBOOK.md) for live-URL and Docker deployment steps. The
 service binds to `0.0.0.0`, needs no login, and requires no environment
-variables to run.
+variables to run (rules-only mode).
+
+To enable the Gemini fallback on a live deployment, set:
+```
+USE_LLM=true
+GEMINI_API_KEY=<your key>
+```
