@@ -106,3 +106,58 @@ def test_all_output_enums_valid():
     assert out.department in DEPARTMENTS
     assert out.evidence_verdict in EVIDENCE_VERDICTS
     assert out.severity in SEVERITIES
+
+
+def test_fraud_velocity_burst():
+    """3 completed transfers to same counterparty within 24h → fraud_velocity_alert."""
+    out = analyze(TicketRequest(
+        ticket_id="FV-1",
+        complaint="I sent money several times today.",
+        transaction_history=[
+            {"transaction_id": "FV-T1", "timestamp": "2026-04-14T08:00:00Z",
+             "type": "transfer", "amount": 500, "counterparty": "+8801799991111", "status": "completed"},
+            {"transaction_id": "FV-T2", "timestamp": "2026-04-14T12:00:00Z",
+             "type": "transfer", "amount": 500, "counterparty": "+8801799991111", "status": "completed"},
+            {"transaction_id": "FV-T3", "timestamp": "2026-04-14T20:00:00Z",
+             "type": "transfer", "amount": 1000, "counterparty": "+8801799991111", "status": "completed"},
+        ],
+    ))
+    assert "fraud_velocity_alert" in out.reason_codes
+    assert out.severity == "critical"
+    assert out.human_review_required is True
+    assert out.department == "fraud_risk"
+
+
+def test_test_then_large_pattern():
+    """Small 'test' transfer (50 BDT) followed by large one (5000 BDT) to same CP."""
+    out = analyze(TicketRequest(
+        ticket_id="FV-2",
+        complaint="I sent some money to a number.",
+        transaction_history=[
+            {"transaction_id": "TL-T1", "timestamp": "2026-04-14T09:00:00Z",
+             "type": "transfer", "amount": 50, "counterparty": "+8801799992222", "status": "completed"},
+            {"transaction_id": "TL-T2", "timestamp": "2026-04-14T10:00:00Z",
+             "type": "transfer", "amount": 5000, "counterparty": "+8801799992222", "status": "completed"},
+        ],
+    ))
+    assert "test_transaction_pattern" in out.reason_codes
+    assert out.severity == "critical"
+    assert out.human_review_required is True
+
+
+def test_fraud_signals_not_triggered_for_normal_pattern():
+    """3 transfers to same CP spread over multiple days → no fraud signal."""
+    out = analyze(TicketRequest(
+        ticket_id="FV-3",
+        complaint="I sent money to my friend.",
+        transaction_history=[
+            {"transaction_id": "NF-T1", "timestamp": "2026-04-10T08:00:00Z",
+             "type": "transfer", "amount": 2000, "counterparty": "+8801799993333", "status": "completed"},
+            {"transaction_id": "NF-T2", "timestamp": "2026-04-12T08:00:00Z",
+             "type": "transfer", "amount": 2000, "counterparty": "+8801799993333", "status": "completed"},
+            {"transaction_id": "NF-T3", "timestamp": "2026-04-14T08:00:00Z",
+             "type": "transfer", "amount": 2000, "counterparty": "+8801799993333", "status": "completed"},
+        ],
+    ))
+    assert "fraud_velocity_alert" not in out.reason_codes
+    assert out.severity != "critical"

@@ -251,6 +251,70 @@ def _investigate_transfer(history, signals: Signals) -> Investigation:
                          "transfer_match")
 
 
+# --- fraud signal detection --------------------------------------------------
+
+def _detect_fraud_signals(history: List[TransactionEntry]) -> List[str]:
+    """Scan transaction history for known fraud patterns.
+
+    Velocity burst  : 3+ completed transfers to the same counterparty within
+                      any 24-hour window → authorized-push-payment fraud risk.
+    Test-then-large : a small transfer (< 200 BDT) to a counterparty followed
+                      chronologically by a large one (> 5× the small) to the
+                      same number → classic "test-the-channel" scam setup.
+    """
+    from collections import defaultdict
+    from datetime import datetime
+
+    result: List[str] = []
+
+    transfers = [
+        e for e in history
+        if (e.type or "") == "transfer" and (e.status or "") == "completed"
+    ]
+    if len(transfers) < 2:
+        return result
+
+    by_cp: dict = defaultdict(list)
+    for e in transfers:
+        cp = normalize_phone(e.counterparty) or (e.counterparty or "")
+        if cp:
+            by_cp[cp].append(e)
+
+    for cp, txns in by_cp.items():
+        if len(txns) < 2:
+            continue
+
+        # Build a time-sorted list, skipping entries with unparseable timestamps.
+        timed: List[Tuple] = []
+        for e in txns:
+            try:
+                ts = datetime.fromisoformat((e.timestamp or "").replace("Z", "+00:00"))
+                timed.append((ts, e))
+            except Exception:
+                pass
+        timed.sort(key=lambda x: x[0])
+
+        # Velocity burst: any 3 consecutive (time-sorted) within 24 h.
+        if len(timed) >= 3:
+            for i in range(len(timed) - 2):
+                if (timed[i + 2][0] - timed[i][0]).total_seconds() <= 86400:
+                    if "fraud_velocity_alert" not in result:
+                        result.append("fraud_velocity_alert")
+                    break
+
+        # Test-then-large: small txn (< 200) chronologically before a large one (> 5×).
+        for i, (ts_i, e_i) in enumerate(timed):
+            amt_i = e_i.amount or 0
+            if 0 < amt_i < 200:
+                for ts_j, e_j in timed[i + 1:]:
+                    if (e_j.amount or 0) > amt_i * 5:
+                        if "test_transaction_pattern" not in result:
+                            result.append("test_transaction_pattern")
+                        break
+
+    return result
+
+
 # --- severity / routing / escalation ----------------------------------------
 
 def severity_for(case_type: str, inv: Investigation) -> str:
@@ -364,7 +428,7 @@ def decide(req: TicketRequest) -> Decision:
 
     case_type = classify(complaint, req, signals, history)
     inv = investigate(case_type, signals, history, complaint, req)
-    return Decision(
+    decision = Decision(
         case_type=case_type,
         investigation=inv,
         severity=severity_for(case_type, inv),
@@ -374,3 +438,15 @@ def decide(req: TicketRequest) -> Decision:
         reason_codes=reason_codes_for(case_type, inv),
         language=language,
     )
+
+    # Fraud signal detection runs over the full history regardless of case_type.
+    # If patterns are found, override severity/routing/escalation — these signals
+    # take priority because they indicate the customer may be an active scam victim.
+    fraud_codes = _detect_fraud_signals(history)
+    if fraud_codes:
+        decision.reason_codes = list(dict.fromkeys(decision.reason_codes + fraud_codes))
+        decision.severity = "critical"
+        decision.human_review = True
+        decision.department = "fraud_risk"
+
+    return decision
