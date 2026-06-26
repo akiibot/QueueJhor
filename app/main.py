@@ -13,8 +13,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
+from .ai_fallback import ai_investigate
 from .config import config
-from .llm import polish
 from .reasoning import decide
 from .replies import build_texts
 from .safety import enforce
@@ -35,22 +35,61 @@ def health():
     return {"status": "ok"}
 
 
+def _is_ambiguous(decision) -> bool:
+    """True when the rules engine could not confidently resolve the ticket.
+
+    Only these cases go to the Gemini fallback. Everything else stays
+    pure-rules regardless of USE_LLM setting.
+    """
+    inv = decision.investigation
+    return (
+        decision.case_type != "phishing_or_social_engineering"  # never AI-route safety cases
+        and (
+            inv.note in ("ambiguous_match", "vague", "no_match")
+            or decision.case_type == "other"
+            or (decision.confidence <= 0.65 and inv.relevant_transaction_id is None)
+        )
+    )
+
+
 def analyze(req: TicketRequest) -> AnalysisResponse:
     """Pure function: TicketRequest -> AnalysisResponse. Easy to unit test."""
     decision = decide(req)
     summary, action, reply = build_texts(decision, req.complaint or "")
 
-    if config.llm_enabled:
-        summary, reply = polish(
-            req.complaint or "",
-            decision.language,
-            decision.case_type,
-            decision.investigation.verdict,
-            summary,
-            reply,
+    # AI fallback: only fires when rules are genuinely uncertain AND a Gemini
+    # key is configured. Clear/confident cases never make an API call.
+    if config.llm_enabled and _is_ambiguous(decision):
+        ai_result = ai_investigate(
+            complaint=req.complaint or "",
+            language=decision.language,
+            transaction_history=[
+                t.model_dump() for t in (req.transaction_history or [])
+            ],
+            rules_hint=f"case_type={decision.case_type}, note={decision.investigation.note}",
         )
+        if ai_result:
+            # Overwrite only the fields Gemini returned and validated.
+            if "case_type" in ai_result:
+                decision.case_type = ai_result["case_type"]
+            if "evidence_verdict" in ai_result:
+                decision.investigation.verdict = ai_result["evidence_verdict"]
+            if "relevant_transaction_id" in ai_result:
+                decision.investigation.relevant_transaction_id = ai_result["relevant_transaction_id"]
+            if "severity" in ai_result:
+                decision.severity = ai_result["severity"]
+            if "department" in ai_result:
+                decision.department = ai_result["department"]
+            if "human_review_required" in ai_result:
+                decision.human_review = ai_result["human_review_required"]
+            summary = ai_result.get("agent_summary", summary)
+            action  = ai_result.get("recommended_next_action", action)
+            reply   = ai_result.get("customer_reply", reply)
+            decision.reason_codes = list(dict.fromkeys(
+                decision.reason_codes + ["ai_fallback_used"]
+            ))
 
-    # Safety backstop always runs last, on whatever text we ended up with.
+    # Safety backstop always runs last — on rules text AND Gemini text.
     reply, action = enforce(reply, action, decision.language)
 
     return AnalysisResponse(
